@@ -1,9 +1,10 @@
 """
-Pensum soppquiz — keyboard-first quiz.
+Pensum soppquiz: keyboard-first quiz.
 
 Much like soppquiz.mooo.com: a random species from pensum.json is picked,
-a few photos are fetched from Artsobservasjoner.no, and you type/select the
-species name and its edibility status.
+a few CC-licensed photos are fetched (Artsobservasjoner.no when available,
+otherwise other CC sources), and you type/select the species name and its
+edibility status.
 
 The quiz is fully controllable from the keyboard:
   * type the species name -> arrow keys + Enter to pick from the suggestions
@@ -225,50 +226,105 @@ def _is_artsobs_image(url):
     return "artsobservasjoner" in (url or "").lower()
 
 
-def _image_urls_for(usage_key):
-    """StillImage-URLer for en usageKey. Prefererer MediaLibrary / Artsobservasjoner."""
-    candidates = []
-    params = {
-        "taxonKey": usage_key,
-        "mediaType": "StillImage",
-        "limit": 300,
-    }
-    if IMAGE_SOURCE == "artsobs":
-        # Artsobservasjoner-bildene er i GBIF-datasettet "Norwegian Species
-        # Observation Service". Direkte datasett-søk gir mye bedre utbytte enn
-        # å filtrere bort i etterkant fra et generisk taxon-søk.
-        params["datasetKey"] = ARTSSOBS_DATASET_KEY
-    try:
-        r = _gbif_session.get(
-            f"{GBIF_BASE}/occurrence/search",
-            params=params,
-            timeout=30,
-        )
-        r.raise_for_status()
-        for occ in r.json().get("results", []) or []:
-            occ_license = occ.get("license") or ""
-            for med in occ.get("media", []) or []:
-                if med.get("type") != "StillImage":
-                    continue
-                lic = med.get("license") or occ_license
-                if not _is_cc_license(lic):
-                    continue
-                ident = (med.get("identifier") or "").strip()
-                if not ident:
-                    continue
-                if IMAGE_SOURCE == "artsobs" and not _is_artsobs_image(ident):
-                    continue
-                if ident not in candidates:
-                    candidates.append(ident)
-    except Exception as exc:  # noqa: BLE001
-        log.warning("GBIF occurrence/search uk=%s mislyktes: %s", usage_key, exc)
+def _license_label(lic):
+    """Kort, lesbar etikett for en GBIF-lisens (kortkode eller full URL)."""
+    lic = (lic or "").strip()
+    if not lic:
+        return ""
+    low = lic.lower()
+    if "creativecommons.org" in low:
+        m = re.search(r"/(?:licenses|publicdomain)/([a-z0-9\-]+)/([0-9.]+)", low)
+        if m:
+            code, ver = m.group(1), m.group(2).rstrip(".")
+            if code == "zero":
+                return f"CC0 {ver}"
+            return "CC " + code.upper() + " " + ver
+        return "Creative Commons"
+    code = low.upper().replace("-", "_")
+    if code.startswith("CC0"):
+        ver = code[3:].lstrip("_").replace("_", ".")
+        return ("CC0 " + ver).strip()
+    if code.startswith("CC_"):
+        tokens = code[3:].split("_")
+        elems = [t for t in tokens if t.isalpha()]
+        ver = ".".join(t for t in tokens if t.isdigit())
+        return ("CC " + "-".join(elems) + (" " + ver if ver else "")).strip()
+    return lic
 
-    def sort_key(url):
-        low = url.lower()
-        return 0 if ("mediaLibrary" in low or "artsobservasjoner" in low) else 1
 
-    candidates.sort(key=sort_key)
-    return candidates
+def _owner_for(occ, med):
+    """Fotograf/rettighetshaver for et medie, med fornuftige fallback."""
+    for cand in (med.get("rightsHolder"), med.get("creator"),
+                 occ.get("rightsHolder"), occ.get("recordedBy")):
+        if cand and str(cand).strip():
+            return str(cand).strip()
+    return ""
+
+
+def _images_for(usage_key):
+    """Bilder for en usageKey, som dikter med url/fotograf/lisens.
+
+    Prefererer Artsobservasjoner; hvis den kilden ikke har noen CC-bilder for
+    arten faller vi tilbake til andre CC-lisensierte GBIF-medier.
+    """
+    def collect(dataset_key, require_artsobs):
+        params = {"taxonKey": usage_key, "mediaType": "StillImage", "limit": 300}
+        if dataset_key:
+            # Artsobservasjoner-bildene er i GBIF-datasettet "Norwegian Species
+            # Observation Service". Direkte datasett-søk gir mye bedre utbytte
+            # enn å filtrere bort i etterkant fra et generisk takson-søk.
+            params["datasetKey"] = dataset_key
+        out = []
+        try:
+            r = _gbif_session.get(
+                f"{GBIF_BASE}/occurrence/search",
+                params=params,
+                timeout=30,
+            )
+            r.raise_for_status()
+            for occ in r.json().get("results", []) or []:
+                occ_license = occ.get("license") or ""
+                for med in occ.get("media", []) or []:
+                    if med.get("type") != "StillImage":
+                        continue
+                    lic = med.get("license") or occ_license
+                    if not _is_cc_license(lic):
+                        continue
+                    ident = (med.get("identifier") or "").strip()
+                    if not ident:
+                        continue
+                    is_artsobs = _is_artsobs_image(ident)
+                    if require_artsobs and not is_artsobs:
+                        continue
+                    out.append({
+                        "url": ident,
+                        "owner": _owner_for(occ, med),
+                        "license": _license_label(lic),
+                        "license_url": lic if lic.lower().startswith("http") else "",
+                        "source": "artsobs" if is_artsobs else "other",
+                    })
+        except Exception as exc:  # noqa: BLE001
+            log.warning("GBIF occurrence/search uk=%s mislyktes: %s", usage_key, exc)
+        return out
+
+    if IMAGE_SOURCE == "all":
+        images = collect(None, False)
+    else:
+        images = collect(ARTSSOBS_DATASET_KEY, True)
+        if not images:
+            # Fallback: Artsobservasjoner mangler bilder for denne arten, så vi
+            # bruker andre CC-lisensierte kilder (iNaturalist m.fl.).
+            images = collect(None, False)
+
+    seen = set()
+    unique = []
+    for img in images:
+        if img["url"] in seen:
+            continue
+        seen.add(img["url"])
+        unique.append(img)
+    unique.sort(key=lambda i: 0 if i["source"] == "artsobs" else 1)
+    return unique
 
 
 # --- disk-cache for takson- og bilderesultater -------------------------------
@@ -295,8 +351,26 @@ def _save_disk_cache(cache):
         log.warning("kunne ikke skrive %s: %s", DISK_CACHE_PATH, exc)
 
 
+def _normalize_cached(entry):
+    """Cachet oppslag -> liste av bildedikter, eller None hvis ingenting cachet.
+
+    Eldre cache skrev bare URL-strenger under nøkkelen "urls".
+    """
+    imgs = entry.get("images")
+    if imgs is None:
+        urls = entry.get("urls")
+        if urls is None:
+            return None
+        imgs = [
+            {"url": u, "owner": "", "license": "", "license_url": "",
+             "source": "artsobs" if _is_artsobs_image(u) else "other"}
+            for u in urls
+        ]
+    return imgs
+
+
 def fetch_images(species, latin=None):
-    """Return (urls, error_text_or_None). Disk-cachet per art i ett døgn."""
+    """Return (images, error_text_or_None). Disk-cachet per art i ett døgn."""
     latin = (latin or _latin_for(species) or "").strip()
     now = time.time()
     key = species.lower()
@@ -305,36 +379,38 @@ def fetch_images(species, latin=None):
         cache = _load_disk_cache()
         entry = cache.get(key) or {}
 
-        # Gyldig disk-cache?
+        # Gyldig disk-cache? Tomme treff caches ikke som gyldige, slik at nye
+        # kilder/fallback kan prøves på nytt.
         ts = entry.get("ts") or 0
-        if now - ts < IMAGE_CACHE_TTL and entry.get("urls") is not None:
-            return list(entry["urls"]), None
+        imgs = _normalize_cached(entry)
+        if now - ts < IMAGE_CACHE_TTL and imgs:
+            return [dict(i) for i in imgs], None
         if key in _cached_offline:
-            return [], "nettverksfeil (cached offline) - trykk R for nytt forsøk"
+            return [], "nettverksfeil (cached offline). Trykk R for nytt forsøk"
 
     # Unn deg litt fart: bruk nett i bakgrunnen én gang, deretter cache.
     uk = resolve_taxon_key(latin) if latin else None
     if not uk:
         with _CACHE_LOCK:
             cache = _load_disk_cache()
-            cache[key] = {"ts": now, "urls": []}
+            cache[key] = {"ts": now, "images": []}
             _save_disk_cache(cache)
             _cached_offline.add(key)
         return [], f"fant ikke GBIF-takson for '{species}'"
 
-    urls = _image_urls_for(uk)
+    images = _images_for(uk)
 
     with _CACHE_LOCK:
         cache = _load_disk_cache()
-        cache[key] = {"ts": now, "urls": urls, "uk": uk}
+        cache[key] = {"ts": now, "images": images, "uk": uk}
         # Synkroniser nedskriving (kun én skriving av gangen)
         _save_disk_cache(cache)
-        if not urls:
+        if not images:
             _cached_offline.add(key)
 
-    if not urls:
+    if not images:
         return [], f"ingen bilder i GBIF for '{species}'"
-    return urls, None
+    return images, None
 
 
 # Pensum data
@@ -403,9 +479,9 @@ def quiz():
     _recent.append(art["name"])
     del _recent[:-repeat_window]
 
-    image_urls, error = fetch_images(art["name"])
-    random.shuffle(image_urls)
-    image_urls = image_urls[:IMAGES_PER_QUESTION]
+    images, error = fetch_images(art["name"])
+    random.shuffle(images)
+    images = images[:IMAGES_PER_QUESTION]
 
     names = sorted({a["name"] for a in PENSUM}, key=str.lower)
     answer = {
@@ -418,7 +494,7 @@ def quiz():
     html = PAGE_TEMPLATE
     html = html.replace("__PENSUM__", json.dumps(names, ensure_ascii=False))
     html = html.replace("__ANSWER__", json.dumps(answer, ensure_ascii=False))
-    html = html.replace("__GRID__", _images_grid(image_urls, error))
+    html = html.replace("__GRID__", _images_grid(images, error))
     html = html.replace("__SOURCE_TEXT__", _source_footer_text())
     return html
 
@@ -427,7 +503,8 @@ def _source_footer_text():
     """Tekst i footeren som beskriver bildekildene ut fra IMAGE_SOURCE."""
     if IMAGE_SOURCE == "artsobs":
         return ('<a href="https://artsobservasjoner.no" target="_blank" rel="noopener">'
-                "Artsobservasjoner.no</a> (kun Creative Commons-lisensiert)")
+                "Artsobservasjoner.no</a> (kun Creative Commons-lisensiert, "
+                "med andre CC-kilder der Artsobservasjoner mangler)")
     return ("GBIF-bilder fra <a href=\"https://artsobservasjoner.no\" "
             "target=\"_blank\" rel=\"noopener\">Artsobservasjoner.no</a>, "
             "iNaturalist m.fl. (kun Creative Commons-lisensiert)")
@@ -438,8 +515,8 @@ def search():
     q = (request.args.get("q") or "").strip()
     if not q:
         return "Bruk ?q=&lt;navn&gt;", 400
-    image_urls, error = fetch_images(q)
-    grid = _images_grid(image_urls, error)
+    images, error = fetch_images(q)
+    grid = _images_grid(images, error)
     body = f"<h1>{escape(q)}</h1>" + grid + '<p><a href="/">Gå tilbake til quizzen</a></p>'
     return _wrap_page(body)
 
@@ -453,15 +530,23 @@ def healthz():
 # Rendering helpers
 # ---------------------------------------------------------------------------
 
-def _images_grid(image_urls, error):
-    if not image_urls:
-        msg = "Kunne ikke hente bilder fra Artsobservasjoner (%s). Trykk R for et nytt spørsmål."
+def _images_grid(images, error):
+    if not images:
+        msg = "Kunne ikke hente bilder fra GBIF (%s). Trykk R for et nytt spørsmål."
         return f'<div class="placeholder" id="noimages">{msg % escape(str(error))}</div>'
     cells = []
-    for url in image_urls:
+    for img in images:
+        url = img.get("url") or ""
+        owner = img.get("owner") or ""
+        license_label = img.get("license") or ""
+        tip = "Foto: " + owner if owner else "Bilde"
+        if license_label:
+            tip += " (" + license_label + ")"
         cells.append(
-            f'<a class="cell" href="{escape(url)}" target="_blank" rel="noopener">'
-            f'<img src="{escape(url)}" alt="" loading="eager"></a>'
+            '<a class="cell" href="%s" target="_blank" rel="noopener">'
+            '<img src="%s" alt="" loading="eager">'
+            '<span class="cc" title="%s">CC</span>'
+            "</a>" % (escape(url), escape(url), escape(tip))
         )
     return '<div class="grid">%s</div>' % "".join(cells)
 
@@ -510,10 +595,13 @@ PAGE_TEMPLATE = """<!doctype html>
          padding:20px;box-shadow:0 10px 30px rgba(80,55,20,.06);}
   .question{font-size:18px;font-weight:600;margin:0 0 14px;}
   .grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(200px,1fr));gap:10px;}
-  .cell{display:block;border-radius:10px;overflow:hidden;border:1px solid var(--line);
+  .cell{position:relative;display:block;border-radius:10px;overflow:hidden;border:1px solid var(--line);
         background:#efe7d8;aspect-ratio:1/1;}
   .cell img{width:100%;height:100%;object-fit:cover;display:block;transition:transform .12s ease;}
   .cell:hover img{transform:scale(1.03);}
+  .cc{position:absolute;right:6px;bottom:6px;padding:2px 6px;border-radius:6px;
+      background:rgba(0,0,0,.62);color:#fff;font-size:11px;font-weight:700;line-height:1.2;
+      letter-spacing:.02em;cursor:help;user-select:none;}
   .placeholder{border:1px dashed var(--line);border-radius:10px;padding:26px;color:var(--ko);
                background:#fdf3ee;}
   .inputs{display:grid;grid-template-columns:2fr 1fr;gap:10px;margin-top:4px;}
